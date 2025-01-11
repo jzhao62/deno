@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
@@ -37,11 +37,12 @@ async fn main() -> Result<(), AnyError> {
   let main_module = ModuleSpecifier::from_file_path(js_path).unwrap();
   eprintln!("Running {main_module}...");
   let fs = Arc::new(RealFs);
-  let permission_desc_parser =
-    Arc::new(RuntimePermissionDescriptorParser::new(fs.clone()));
+  let permission_desc_parser = Arc::new(
+    RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys),
+  );
   let mut worker = MainWorker::bootstrap_from_options(
     main_module.clone(),
-    WorkerServiceOptions {
+    WorkerServiceOptions::<sys_traits::impls::RealSys> {
       module_loader: Rc::new(FsModuleLoader),
       permissions: PermissionsContainer::allow_all(permission_desc_parser),
       blob_store: Default::default(),
@@ -50,6 +51,7 @@ async fn main() -> Result<(), AnyError> {
       node_services: Default::default(),
       npm_process_state_provider: Default::default(),
       root_cert_store_provider: Default::default(),
+      fetch_dns_resolver: Default::default(),
       shared_array_buffer_store: Default::default(),
       compiled_wasm_module_store: Default::default(),
       v8_code_cache: Default::default(),

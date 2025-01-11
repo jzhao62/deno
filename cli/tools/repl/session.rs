@@ -1,22 +1,6 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::sync::Arc;
-
-use crate::args::CliOptions;
-use crate::cdp;
-use crate::colors;
-use crate::lsp::ReplLanguageServer;
-use crate::npm::CliNpmResolver;
-use crate::resolver::CliGraphResolver;
-use crate::tools::test::report_tests;
-use crate::tools::test::reporters::PrettyTestReporter;
-use crate::tools::test::reporters::TestReporter;
-use crate::tools::test::run_tests_for_worker;
-use crate::tools::test::send_test_event;
-use crate::tools::test::worker_has_tests;
-use crate::tools::test::TestEvent;
-use crate::tools::test::TestEventReceiver;
-use crate::tools::test::TestFailureFormatOptions;
 
 use deno_ast::diagnostics::Diagnostic;
 use deno_ast::swc::ast as swc_ast;
@@ -32,8 +16,9 @@ use deno_ast::ParsedSource;
 use deno_ast::SourcePos;
 use deno_ast::SourceRangedForSpanned;
 use deno_ast::SourceTextInfo;
-use deno_core::error::generic_error;
+use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
+use deno_core::error::CoreError;
 use deno_core::futures::channel::mpsc::UnboundedReceiver;
 use deno_core::futures::FutureExt;
 use deno_core::futures::StreamExt;
@@ -43,17 +28,34 @@ use deno_core::unsync::spawn;
 use deno_core::url::Url;
 use deno_core::LocalInspectorSession;
 use deno_core::PollEventLoopOptions;
-use deno_graph::source::ResolutionMode;
-use deno_graph::source::Resolver;
+use deno_error::JsErrorBox;
 use deno_graph::Position;
 use deno_graph::PositionRange;
 use deno_graph::SpecifierWithRange;
 use deno_runtime::worker::MainWorker;
 use deno_semver::npm::NpmPackageReqReference;
+use node_resolver::NodeResolutionKind;
+use node_resolver::ResolutionMode;
 use once_cell::sync::Lazy;
 use regex::Match;
 use regex::Regex;
 use tokio::sync::Mutex;
+
+use crate::args::CliOptions;
+use crate::cdp;
+use crate::colors;
+use crate::lsp::ReplLanguageServer;
+use crate::npm::CliNpmResolver;
+use crate::resolver::CliResolver;
+use crate::tools::test::report_tests;
+use crate::tools::test::reporters::PrettyTestReporter;
+use crate::tools::test::reporters::TestReporter;
+use crate::tools::test::run_tests_for_worker;
+use crate::tools::test::send_test_event;
+use crate::tools::test::worker_has_tests;
+use crate::tools::test::TestEvent;
+use crate::tools::test::TestEventReceiver;
+use crate::tools::test::TestFailureFormatOptions;
 
 fn comment_source_to_position_range(
   comment_start: SourcePos,
@@ -180,7 +182,7 @@ struct ReplJsxState {
 
 pub struct ReplSession {
   npm_resolver: Arc<dyn CliNpmResolver>,
-  resolver: Arc<CliGraphResolver>,
+  resolver: Arc<CliResolver>,
   pub worker: MainWorker,
   session: LocalInspectorSession,
   pub context_id: u64,
@@ -199,7 +201,7 @@ impl ReplSession {
   pub async fn initialize(
     cli_options: &CliOptions,
     npm_resolver: Arc<dyn CliNpmResolver>,
-    resolver: Arc<CliGraphResolver>,
+    resolver: Arc<CliResolver>,
     mut worker: MainWorker,
     main_module: ModuleSpecifier,
     test_event_receiver: TestEventReceiver,
@@ -245,15 +247,15 @@ impl ReplSession {
     assert_ne!(context_id, 0);
 
     let referrer =
-      deno_core::resolve_path("./$deno$repl.ts", cli_options.initial_cwd())
+      deno_core::resolve_path("./$deno$repl.mts", cli_options.initial_cwd())
         .unwrap();
 
     let cwd_url =
       Url::from_directory_path(cli_options.initial_cwd()).map_err(|_| {
-        generic_error(format!(
+        anyhow!(
           "Unable to construct URL from the path of cwd: {}",
           cli_options.initial_cwd().to_string_lossy(),
-        ))
+        )
       })?;
     let ts_config_for_emit = cli_options
       .resolve_ts_config_for_emit(deno_config::deno_json::TsConfigType::Emit)?;
@@ -322,7 +324,7 @@ impl ReplSession {
     &mut self,
     method: &str,
     params: Option<T>,
-  ) -> Result<Value, AnyError> {
+  ) -> Result<Value, CoreError> {
     self
       .worker
       .js_runtime
@@ -339,7 +341,7 @@ impl ReplSession {
       .await
   }
 
-  pub async fn run_event_loop(&mut self) -> Result<(), AnyError> {
+  pub async fn run_event_loop(&mut self) -> Result<(), CoreError> {
     self.worker.run_event_loop(true).await
   }
 
@@ -400,21 +402,29 @@ impl ReplSession {
         }
         Err(err) => {
           // handle a parsing diagnostic
-          match err.downcast_ref::<deno_ast::ParseDiagnostic>() {
+          match crate::util::result::any_and_jserrorbox_downcast_ref::<
+            deno_ast::ParseDiagnostic,
+          >(&err)
+          {
             Some(diagnostic) => {
               Ok(EvaluationOutput::Error(format_diagnostic(diagnostic)))
             }
-            None => match err.downcast_ref::<ParseDiagnosticsError>() {
-              Some(diagnostics) => Ok(EvaluationOutput::Error(
-                diagnostics
-                  .0
-                  .iter()
-                  .map(format_diagnostic)
-                  .collect::<Vec<_>>()
-                  .join("\n\n"),
-              )),
-              None => Err(err),
-            },
+            None => {
+              match crate::util::result::any_and_jserrorbox_downcast_ref::<
+                ParseDiagnosticsError,
+              >(&err)
+              {
+                Some(diagnostics) => Ok(EvaluationOutput::Error(
+                  diagnostics
+                    .0
+                    .iter()
+                    .map(format_diagnostic)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                )),
+                None => Err(err),
+              }
+            }
           }
         }
       }
@@ -701,18 +711,19 @@ impl ReplSession {
     let mut collector = ImportCollector::new();
     program.visit_with(&mut collector);
 
-    let referrer_range = deno_graph::Range {
-      specifier: self.referrer.clone(),
-      start: deno_graph::Position::zeroed(),
-      end: deno_graph::Position::zeroed(),
-    };
     let resolved_imports = collector
       .imports
       .iter()
       .flat_map(|i| {
         self
           .resolver
-          .resolve(i, &referrer_range, ResolutionMode::Execution)
+          .resolve(
+            i,
+            &self.referrer,
+            deno_graph::Position::zeroed(),
+            ResolutionMode::Import,
+            NodeResolutionKind::Execution,
+          )
           .ok()
           .or_else(|| ModuleSpecifier::parse(i).ok())
       })
@@ -726,7 +737,9 @@ impl ReplSession {
     let has_node_specifier =
       resolved_imports.iter().any(|url| url.scheme() == "node");
     if !npm_imports.is_empty() || has_node_specifier {
-      npm_resolver.add_package_reqs(&npm_imports).await?;
+      npm_resolver
+        .add_and_cache_package_reqs(&npm_imports)
+        .await?;
 
       // prevent messages in the repl about @types/node not being cached
       if has_node_specifier {
@@ -739,7 +752,7 @@ impl ReplSession {
   async fn evaluate_expression(
     &mut self,
     expression: &str,
-  ) -> Result<cdp::EvaluateResponse, AnyError> {
+  ) -> Result<cdp::EvaluateResponse, CoreError> {
     self
       .post_message_with_event_loop(
         "Runtime.evaluate",
@@ -762,7 +775,9 @@ impl ReplSession {
         }),
       )
       .await
-      .and_then(|res| serde_json::from_value(res).map_err(|e| e.into()))
+      .and_then(|res| {
+        serde_json::from_value(res).map_err(|e| JsErrorBox::from_err(e).into())
+      })
   }
 }
 
