@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 pub use deno_broadcast_channel;
 pub use deno_cache;
@@ -27,14 +27,15 @@ pub use deno_websocket;
 pub use deno_webstorage;
 
 pub mod code_cache;
-pub mod errors;
 pub mod fmt_errors;
 pub mod fs_util;
 pub mod inspector_server;
 pub mod js;
 pub mod ops;
 pub mod permissions;
+pub mod signal;
 pub mod snapshot;
+pub mod sys_info;
 pub mod tokio_util;
 pub mod web_worker;
 pub mod worker;
@@ -44,7 +45,7 @@ pub use worker_bootstrap::BootstrapOptions;
 pub use worker_bootstrap::WorkerExecutionMode;
 pub use worker_bootstrap::WorkerLogLevel;
 
-mod shared;
+pub mod shared;
 pub use shared::runtime;
 
 pub struct UnstableGranularFlag {
@@ -99,18 +100,30 @@ pub static UNSTABLE_GRANULAR_FLAGS: &[UnstableGranularFlag] = &[
     show_in_help: true,
     id: 7,
   },
+  UnstableGranularFlag {
+    name: "node-globals",
+    help_text: "Expose Node globals everywhere",
+    show_in_help: true,
+    id: 8,
+  },
+  UnstableGranularFlag {
+    name: "otel",
+    help_text: "Enable unstable OpenTelemetry features",
+    show_in_help: false,
+    id: 9,
+  },
   // TODO(bartlomieju): consider removing it
   UnstableGranularFlag {
     name: ops::process::UNSTABLE_FEATURE_NAME,
     help_text: "Enable unstable process APIs",
     show_in_help: false,
-    id: 8,
+    id: 10,
   },
   UnstableGranularFlag {
     name: "temporal",
     help_text: "Enable unstable Temporal API",
     show_in_help: true,
-    id: 9,
+    id: 11,
   },
   UnstableGranularFlag {
     name: "unsafe-proto",
@@ -118,21 +131,27 @@ pub static UNSTABLE_GRANULAR_FLAGS: &[UnstableGranularFlag] = &[
     show_in_help: true,
     // This number is used directly in the JS code. Search
     // for "unstableIds" to see where it's used.
-    id: 10,
+    id: 12,
   },
   UnstableGranularFlag {
     name: deno_webgpu::UNSTABLE_FEATURE_NAME,
     help_text: "Enable unstable `WebGPU` APIs",
     show_in_help: true,
-    id: 11,
+    id: 13,
   },
   UnstableGranularFlag {
     name: ops::worker_host::UNSTABLE_FEATURE_NAME,
     help_text: "Enable unstable Web Worker APIs",
     show_in_help: true,
-    id: 12,
+    id: 14,
   },
 ];
+
+pub fn exit(code: i32) -> ! {
+  deno_telemetry::flush();
+  #[allow(clippy::disallowed_methods)]
+  std::process::exit(code);
+}
 
 #[cfg(test)]
 mod test {

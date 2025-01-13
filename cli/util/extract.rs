@@ -1,4 +1,8 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::sync::Arc;
 
 use deno_ast::swc::ast;
 use deno_ast::swc::atoms::Atom;
@@ -13,14 +17,12 @@ use deno_ast::swc::visit::VisitMut;
 use deno_ast::swc::visit::VisitWith as _;
 use deno_ast::MediaType;
 use deno_ast::SourceRangedForSpanned as _;
+use deno_cache_dir::file_fetcher::File;
 use deno_core::error::AnyError;
 use deno_core::ModuleSpecifier;
 use regex::Regex;
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
-use std::sync::Arc;
 
-use crate::file_fetcher::File;
+use crate::file_fetcher::TextDecodedFile;
 use crate::util::path::mapped_specifier_for_tsc;
 
 /// Extracts doc tests from a given file, transforms them into pseudo test
@@ -52,7 +54,7 @@ fn extract_inner(
   file: File,
   wrap_kind: WrapKind,
 ) -> Result<Vec<File>, AnyError> {
-  let file = file.into_text_decoded()?;
+  let file = TextDecodedFile::decode(file)?;
 
   let exports = match deno_ast::parse_program(deno_ast::ParseParams {
     specifier: file.specifier.clone(),
@@ -230,7 +232,7 @@ fn extract_files_from_regex_blocks(
           .unwrap_or(file_specifier);
 
       Some(File {
-        specifier: file_specifier,
+        url: file_specifier,
         maybe_headers: None,
         source: file_source.into_bytes().into(),
       })
@@ -558,7 +560,7 @@ fn generate_pseudo_file(
   exports: &ExportCollector,
   wrap_kind: WrapKind,
 ) -> Result<File, AnyError> {
-  let file = file.into_text_decoded()?;
+  let file = TextDecodedFile::decode(file)?;
 
   let parsed = deno_ast::parse_program(deno_ast::ParseParams {
     specifier: file.specifier.clone(),
@@ -586,12 +588,15 @@ fn generate_pseudo_file(
         wrap_kind,
       }));
 
-  let source = deno_ast::swc::codegen::to_code(&transformed);
+  let source = deno_ast::swc::codegen::to_code_with_comments(
+    Some(&parsed.comments().as_single_threaded()),
+    &transformed,
+  );
 
   log::debug!("{}:\n{}", file.specifier, source);
 
   Ok(File {
-    specifier: file.specifier,
+    url: file.specifier,
     maybe_headers: None,
     source: source.into_bytes().into(),
   })
@@ -804,10 +809,11 @@ fn wrap_in_deno_test(stmts: Vec<ast::Stmt>, test_name: Atom) -> ast::Stmt {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
-  use crate::file_fetcher::TextDecodedFile;
   use deno_ast::swc::atoms::Atom;
   use pretty_assertions::assert_eq;
+
+  use super::*;
+  use crate::file_fetcher::TextDecodedFile;
 
   #[test]
   fn test_extract_doc_tests() {
@@ -1165,18 +1171,45 @@ Deno.test("file:///main.ts$3-6.ts", async ()=>{
           media_type: MediaType::TypeScript,
         }],
       },
+      // https://github.com/denoland/deno/issues/26728
+      Test {
+        input: Input {
+          source: r#"
+/**
+ * ```ts
+ * // @ts-expect-error: can only add numbers
+ * add('1', '2');
+ * ```
+ */
+export function add(first: number, second: number) {
+  return first + second;
+}
+"#,
+          specifier: "file:///main.ts",
+        },
+        expected: vec![Expected {
+          source: r#"import { add } from "file:///main.ts";
+Deno.test("file:///main.ts$3-7.ts", async ()=>{
+    // @ts-expect-error: can only add numbers
+    add('1', '2');
+});
+"#,
+          specifier: "file:///main.ts$3-7.ts",
+          media_type: MediaType::TypeScript,
+        }],
+      },
     ];
 
     for test in tests {
       let file = File {
-        specifier: ModuleSpecifier::parse(test.input.specifier).unwrap(),
+        url: ModuleSpecifier::parse(test.input.specifier).unwrap(),
         maybe_headers: None,
         source: test.input.source.as_bytes().into(),
       };
       let got_decoded = extract_doc_tests(file)
         .unwrap()
         .into_iter()
-        .map(|f| f.into_text_decoded().unwrap())
+        .map(|f| TextDecodedFile::decode(f).unwrap())
         .collect::<Vec<_>>();
       let expected = test
         .expected
@@ -1376,18 +1409,43 @@ console.log(Foo);
           media_type: MediaType::TypeScript,
         }],
       },
+      // https://github.com/denoland/deno/issues/26728
+      Test {
+        input: Input {
+          source: r#"
+/**
+ * ```ts
+ * // @ts-expect-error: can only add numbers
+ * add('1', '2');
+ * ```
+ */
+export function add(first: number, second: number) {
+  return first + second;
+}
+"#,
+          specifier: "file:///main.ts",
+        },
+        expected: vec![Expected {
+          source: r#"import { add } from "file:///main.ts";
+// @ts-expect-error: can only add numbers
+add('1', '2');
+"#,
+          specifier: "file:///main.ts$3-7.ts",
+          media_type: MediaType::TypeScript,
+        }],
+      },
     ];
 
     for test in tests {
       let file = File {
-        specifier: ModuleSpecifier::parse(test.input.specifier).unwrap(),
+        url: ModuleSpecifier::parse(test.input.specifier).unwrap(),
         maybe_headers: None,
         source: test.input.source.as_bytes().into(),
       };
       let got_decoded = extract_snippet_files(file)
         .unwrap()
         .into_iter()
-        .map(|f| f.into_text_decoded().unwrap())
+        .map(|f| TextDecodedFile::decode(f).unwrap())
         .collect::<Vec<_>>();
       let expected = test
         .expected

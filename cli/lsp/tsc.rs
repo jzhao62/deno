@@ -1,4 +1,67 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use std::cell::RefCell;
+use std::cmp;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::ops::Range;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::thread;
+
+use dashmap::DashMap;
+use deno_ast::MediaType;
+use deno_core::anyhow::anyhow;
+use deno_core::anyhow::Context as _;
+use deno_core::convert::Smi;
+use deno_core::convert::ToV8;
+use deno_core::error::AnyError;
+use deno_core::futures::stream::FuturesOrdered;
+use deno_core::futures::FutureExt;
+use deno_core::futures::StreamExt;
+use deno_core::op2;
+use deno_core::parking_lot::Mutex;
+use deno_core::resolve_url;
+use deno_core::serde::de;
+use deno_core::serde::Deserialize;
+use deno_core::serde::Serialize;
+use deno_core::serde_json;
+use deno_core::serde_json::json;
+use deno_core::serde_json::Value;
+use deno_core::serde_v8;
+use deno_core::v8;
+use deno_core::JsRuntime;
+use deno_core::ModuleSpecifier;
+use deno_core::OpState;
+use deno_core::PollEventLoopOptions;
+use deno_core::RuntimeOptions;
+use deno_path_util::url_to_file_path;
+use deno_runtime::deno_node::SUPPORTED_BUILTIN_NODE_MODULES;
+use deno_runtime::inspector_server::InspectorServer;
+use deno_runtime::tokio_util::create_basic_runtime;
+use indexmap::IndexMap;
+use indexmap::IndexSet;
+use lazy_regex::lazy_regex;
+use log::error;
+use node_resolver::ResolutionMode;
+use once_cell::sync::Lazy;
+use regex::Captures;
+use regex::Regex;
+use serde_repr::Deserialize_repr;
+use serde_repr::Serialize_repr;
+use text_size::TextRange;
+use text_size::TextSize;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use tower_lsp::jsonrpc::Error as LspError;
+use tower_lsp::jsonrpc::Result as LspResult;
+use tower_lsp::lsp_types as lsp;
 
 use super::analysis::CodeActionData;
 use super::code_lens;
@@ -23,7 +86,6 @@ use super::urls::uri_to_url;
 use super::urls::url_to_uri;
 use super::urls::INVALID_SPECIFIER;
 use super::urls::INVALID_URI;
-
 use crate::args::jsr_url;
 use crate::args::FmtOptionsConfig;
 use crate::lsp::logging::lsp_warn;
@@ -34,67 +96,7 @@ use crate::util::path::relative_specifier;
 use crate::util::path::to_percent_decoded_str;
 use crate::util::result::InfallibleResultExt;
 use crate::util::v8::convert;
-use deno_core::convert::Smi;
-use deno_core::convert::ToV8;
-use deno_core::error::StdAnyError;
-use deno_core::futures::stream::FuturesOrdered;
-use deno_core::futures::StreamExt;
-
-use dashmap::DashMap;
-use deno_ast::MediaType;
-use deno_core::anyhow::anyhow;
-use deno_core::anyhow::Context as _;
-use deno_core::error::AnyError;
-use deno_core::futures::FutureExt;
-use deno_core::op2;
-use deno_core::parking_lot::Mutex;
-use deno_core::resolve_url;
-use deno_core::serde::de;
-use deno_core::serde::Deserialize;
-use deno_core::serde::Serialize;
-use deno_core::serde_json;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
-use deno_core::serde_v8;
-use deno_core::v8;
-use deno_core::JsRuntime;
-use deno_core::ModuleSpecifier;
-use deno_core::OpState;
-use deno_core::PollEventLoopOptions;
-use deno_core::RuntimeOptions;
-use deno_path_util::url_to_file_path;
-use deno_runtime::inspector_server::InspectorServer;
-use deno_runtime::tokio_util::create_basic_runtime;
-use indexmap::IndexMap;
-use indexmap::IndexSet;
-use lazy_regex::lazy_regex;
-use log::error;
-use once_cell::sync::Lazy;
-use regex::Captures;
-use regex::Regex;
-use serde_repr::Deserialize_repr;
-use serde_repr::Serialize_repr;
-use std::cell::RefCell;
-use std::cmp;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::ops::Range;
-use std::path::Path;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::thread;
-use text_size::TextRange;
-use text_size::TextSize;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
-use tower_lsp::jsonrpc::Error as LspError;
-use tower_lsp::jsonrpc::Result as LspResult;
-use tower_lsp::lsp_types as lsp;
+use crate::worker::create_isolate_create_params;
 
 static BRACKET_ACCESSOR_RE: Lazy<Regex> =
   lazy_regex!(r#"^\[['"](.+)[\['"]\]$"#);
@@ -1295,16 +1297,10 @@ impl TsServer {
   {
     // When an LSP request is cancelled by the client, the future this is being
     // executed under and any local variables here will be dropped at the next
-    // await point. To pass on that cancellation to the TS thread, we make this
-    // wrapper which cancels the request's token on drop.
-    struct DroppableToken(CancellationToken);
-    impl Drop for DroppableToken {
-      fn drop(&mut self) {
-        self.0.cancel();
-      }
-    }
+    // await point. To pass on that cancellation to the TS thread, we use drop_guard
+    // which cancels the request's token on drop.
     let token = token.child_token();
-    let droppable_token = DroppableToken(token.clone());
+    let droppable_token = token.clone().drop_guard();
     let (tx, mut rx) = oneshot::channel::<Result<String, AnyError>>();
     let change = self.pending_change.lock().take();
 
@@ -1318,7 +1314,7 @@ impl TsServer {
     tokio::select! {
       value = &mut rx => {
         let value = value??;
-        drop(droppable_token);
+        droppable_token.disarm();
         Ok(serde_json::from_str(&value)?)
       }
       _ = token.cancelled() => {
@@ -3415,9 +3411,26 @@ fn parse_code_actions(
           additional_text_edits.extend(change.text_changes.iter().map(|tc| {
             let mut text_edit = tc.as_text_edit(asset_or_doc.line_index());
             if let Some(specifier_rewrite) = &data.specifier_rewrite {
-              text_edit.new_text = text_edit
+              let specifier_index = text_edit
                 .new_text
-                .replace(&specifier_rewrite.0, &specifier_rewrite.1);
+                .char_indices()
+                .find_map(|(b, c)| (c == '\'' || c == '"').then_some(b));
+              if let Some(i) = specifier_index {
+                let mut specifier_part = text_edit.new_text.split_off(i);
+                specifier_part = specifier_part.replace(
+                  &specifier_rewrite.old_specifier,
+                  &specifier_rewrite.new_specifier,
+                );
+                text_edit.new_text.push_str(&specifier_part);
+              }
+              if let Some(deno_types_specifier) =
+                &specifier_rewrite.new_deno_types_specifier
+              {
+                text_edit.new_text = format!(
+                  "// @ts-types=\"{}\"\n{}",
+                  deno_types_specifier, &text_edit.new_text
+                );
+              }
             }
             text_edit
           }));
@@ -3576,17 +3589,28 @@ impl CompletionEntryDetails {
     let mut text_edit = original_item.text_edit.clone();
     if let Some(specifier_rewrite) = &data.specifier_rewrite {
       if let Some(text_edit) = &mut text_edit {
-        match text_edit {
-          lsp::CompletionTextEdit::Edit(text_edit) => {
-            text_edit.new_text = text_edit
-              .new_text
-              .replace(&specifier_rewrite.0, &specifier_rewrite.1);
-          }
+        let new_text = match text_edit {
+          lsp::CompletionTextEdit::Edit(text_edit) => &mut text_edit.new_text,
           lsp::CompletionTextEdit::InsertAndReplace(insert_replace_edit) => {
-            insert_replace_edit.new_text = insert_replace_edit
-              .new_text
-              .replace(&specifier_rewrite.0, &specifier_rewrite.1);
+            &mut insert_replace_edit.new_text
           }
+        };
+        let specifier_index = new_text
+          .char_indices()
+          .find_map(|(b, c)| (c == '\'' || c == '"').then_some(b));
+        if let Some(i) = specifier_index {
+          let mut specifier_part = new_text.split_off(i);
+          specifier_part = specifier_part.replace(
+            &specifier_rewrite.old_specifier,
+            &specifier_rewrite.new_specifier,
+          );
+          new_text.push_str(&specifier_part);
+        }
+        if let Some(deno_types_specifier) =
+          &specifier_rewrite.new_deno_types_specifier
+        {
+          *new_text =
+            format!("// @ts-types=\"{}\"\n{}", deno_types_specifier, new_text);
         }
       }
     }
@@ -3691,6 +3715,13 @@ impl CompletionInfo {
   }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompletionSpecifierRewrite {
+  old_specifier: String,
+  new_specifier: String,
+  new_deno_types_specifier: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionItemData {
@@ -3703,7 +3734,7 @@ pub struct CompletionItemData {
   /// be rewritten by replacing the first string with the second. Intended for
   /// auto-import specifiers to be reverse-import-mapped.
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub specifier_rewrite: Option<(String, String)>,
+  pub specifier_rewrite: Option<CompletionSpecifierRewrite>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub data: Option<Value>,
   pub use_code_snippet: bool,
@@ -3713,7 +3744,7 @@ pub struct CompletionItemData {
 #[serde(rename_all = "camelCase")]
 struct CompletionEntryDataAutoImport {
   module_specifier: String,
-  file_name: String,
+  file_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -3770,9 +3801,20 @@ impl CompletionEntry {
     else {
       return;
     };
-    if let Ok(normalized) = specifier_map.normalize(&raw.file_name) {
-      self.auto_import_data =
-        Some(CompletionNormalizedAutoImportData { raw, normalized });
+    if let Some(file_name) = &raw.file_name {
+      if let Ok(normalized) = specifier_map.normalize(file_name) {
+        self.auto_import_data =
+          Some(CompletionNormalizedAutoImportData { raw, normalized });
+      }
+    } else if SUPPORTED_BUILTIN_NODE_MODULES
+      .contains(&raw.module_specifier.as_str())
+    {
+      if let Ok(normalized) =
+        resolve_url(&format!("node:{}", &raw.module_specifier))
+      {
+        self.auto_import_data =
+          Some(CompletionNormalizedAutoImportData { raw, normalized });
+      }
     }
   }
 
@@ -3925,20 +3967,45 @@ impl CompletionEntry {
     if let Some(source) = &self.source {
       let mut display_source = source.clone();
       if let Some(import_data) = &self.auto_import_data {
-        if let Some(new_module_specifier) = language_server
-          .get_ts_response_import_mapper(specifier)
+        let import_mapper =
+          language_server.get_ts_response_import_mapper(specifier);
+        if let Some(mut new_specifier) = import_mapper
           .check_specifier(&import_data.normalized, specifier)
           .or_else(|| relative_specifier(specifier, &import_data.normalized))
+          .or_else(|| {
+            ModuleSpecifier::parse(&import_data.raw.module_specifier)
+              .is_ok()
+              .then(|| import_data.normalized.to_string())
+          })
         {
-          if new_module_specifier.contains("/node_modules/") {
+          if new_specifier.contains("/node_modules/") {
             return None;
           }
-          display_source.clone_from(&new_module_specifier);
-          if new_module_specifier != import_data.raw.module_specifier {
-            specifier_rewrite = Some((
-              import_data.raw.module_specifier.clone(),
-              new_module_specifier,
-            ));
+          let mut new_deno_types_specifier = None;
+          if let Some(code_specifier) = language_server
+            .resolver
+            .deno_types_to_code_resolution(
+              &import_data.normalized,
+              Some(specifier),
+            )
+            .and_then(|s| {
+              import_mapper
+                .check_specifier(&s, specifier)
+                .or_else(|| relative_specifier(specifier, &s))
+            })
+          {
+            new_deno_types_specifier =
+              Some(std::mem::replace(&mut new_specifier, code_specifier));
+          }
+          display_source.clone_from(&new_specifier);
+          if new_specifier != import_data.raw.module_specifier
+            || new_deno_types_specifier.is_some()
+          {
+            specifier_rewrite = Some(CompletionSpecifierRewrite {
+              old_specifier: import_data.raw.module_specifier.clone(),
+              new_specifier,
+              new_deno_types_specifier,
+            });
           }
         } else if source.starts_with(jsr_url().as_str()) {
           return None;
@@ -4244,9 +4311,7 @@ impl TscSpecifierMap {
       return specifier.to_string();
     }
     let mut specifier = original.to_string();
-    if specifier.contains("/node_modules/.deno/")
-      && !specifier.contains("/node_modules/@types/node/")
-    {
+    if !specifier.contains("/node_modules/@types/node/") {
       // The ts server doesn't give completions from files in
       // `node_modules/.deno/`. We work around it like this.
       specifier = specifier.replace("/node_modules/", "/$node_modules/");
@@ -4270,7 +4335,7 @@ impl TscSpecifierMap {
   pub fn normalize<S: AsRef<str>>(
     &self,
     specifier: S,
-  ) -> Result<ModuleSpecifier, AnyError> {
+  ) -> Result<ModuleSpecifier, deno_core::url::ParseError> {
     let original = specifier.as_ref();
     if let Some(specifier) = self.normalized_specifiers.get(original) {
       return Ok(specifier.clone());
@@ -4278,7 +4343,7 @@ impl TscSpecifierMap {
     let specifier_str = original.replace(".d.ts.d.ts", ".d.ts");
     let specifier = match ModuleSpecifier::parse(&specifier_str) {
       Ok(s) => s,
-      Err(err) => return Err(err.into()),
+      Err(err) => return Err(err),
     };
     if specifier.as_str() != original {
       self
@@ -4376,6 +4441,16 @@ fn op_is_node_file(state: &mut OpState, #[string] path: String) -> bool {
   r
 }
 
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+enum LoadError {
+  #[error("{0}")]
+  #[class(inherit)]
+  UrlParse(#[from] deno_core::url::ParseError),
+  #[error("{0}")]
+  #[class(inherit)]
+  SerdeV8(#[from] serde_v8::Error),
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadResponse {
@@ -4390,7 +4465,7 @@ fn op_load<'s>(
   scope: &'s mut v8::HandleScope,
   state: &mut OpState,
   #[string] specifier: &str,
-) -> Result<v8::Local<'s, v8::Value>, AnyError> {
+) -> Result<v8::Local<'s, v8::Value>, LoadError> {
   let state = state.borrow_mut::<State>();
   let mark = state
     .performance
@@ -4401,30 +4476,18 @@ fn op_load<'s>(
       None
     } else {
       let asset_or_document = state.get_asset_or_document(&specifier);
-      asset_or_document.map(|doc| {
-        let maybe_cjs_tracker = state
-          .state_snapshot
-          .resolver
-          .maybe_cjs_tracker(Some(&specifier));
-        LoadResponse {
-          data: doc.text(),
-          script_kind: crate::tsc::as_ts_script_kind(doc.media_type()),
-          version: state.script_version(&specifier),
-          is_cjs: maybe_cjs_tracker
-            .map(|t| {
-              t.is_cjs(
-                &specifier,
-                doc.media_type(),
-                doc.maybe_parsed_source().and_then(|p| p.as_ref().ok()),
-              )
-            })
-            .unwrap_or(false),
-        }
+      asset_or_document.map(|doc| LoadResponse {
+        data: doc.text(),
+        script_kind: crate::tsc::as_ts_script_kind(doc.media_type()),
+        version: state.script_version(&specifier),
+        is_cjs: doc
+          .document()
+          .map(|d| d.resolution_mode())
+          .unwrap_or(ResolutionMode::Import)
+          == ResolutionMode::Require,
       })
     };
-
   let serialized = serde_v8::to_v8(scope, maybe_load_response)?;
-
   state.performance.measure(mark);
   Ok(serialized)
 }
@@ -4433,7 +4496,7 @@ fn op_load<'s>(
 fn op_release(
   state: &mut OpState,
   #[string] specifier: &str,
-) -> Result<(), AnyError> {
+) -> Result<(), deno_core::url::ParseError> {
   let state = state.borrow_mut::<State>();
   let mark = state
     .performance
@@ -4446,20 +4509,13 @@ fn op_release(
 
 #[op2]
 #[serde]
+#[allow(clippy::type_complexity)]
 fn op_resolve(
   state: &mut OpState,
   #[string] base: String,
-  is_base_cjs: bool,
-  #[serde] specifiers: Vec<String>,
-) -> Result<Vec<Option<(String, String)>>, AnyError> {
-  op_resolve_inner(
-    state,
-    ResolveArgs {
-      base,
-      is_base_cjs,
-      specifiers,
-    },
-  )
+  #[serde] specifiers: Vec<(bool, String)>,
+) -> Result<Vec<Option<(String, Option<String>)>>, deno_core::url::ParseError> {
+  op_resolve_inner(state, ResolveArgs { base, specifiers })
 }
 
 struct TscRequestArray {
@@ -4470,7 +4526,7 @@ struct TscRequestArray {
 }
 
 impl<'a> ToV8<'a> for TscRequestArray {
-  type Error = StdAnyError;
+  type Error = serde_v8::Error;
 
   fn to_v8(
     self,
@@ -4482,11 +4538,10 @@ impl<'a> ToV8<'a> for TscRequestArray {
 
     let method_name = deno_core::FastString::from_static(method_name)
       .v8_string(scope)
+      .unwrap()
       .into();
     let args = args.unwrap_or_else(|| v8::Array::new(scope, 0).into());
-    let scope_url = serde_v8::to_v8(scope, self.scope)
-      .map_err(AnyError::from)
-      .map_err(StdAnyError::from)?;
+    let scope_url = serde_v8::to_v8(scope, self.scope)?;
 
     let change = self.change.to_v8(scope).unwrap_infallible();
 
@@ -4541,10 +4596,11 @@ async fn op_poll_requests(
 }
 
 #[inline]
+#[allow(clippy::type_complexity)]
 fn op_resolve_inner(
   state: &mut OpState,
   args: ResolveArgs,
-) -> Result<Vec<Option<(String, String)>>, AnyError> {
+) -> Result<Vec<Option<(String, Option<String>)>>, deno_core::url::ParseError> {
   let state = state.borrow_mut::<State>();
   let mark = state.performance.mark_with_args("tsc.op.op_resolve", &args);
   let referrer = state.specifier_map.normalize(&args.base)?;
@@ -4557,7 +4613,11 @@ fn op_resolve_inner(
       o.map(|(s, mt)| {
         (
           state.specifier_map.denormalize(&s),
-          mt.as_ts_extension().to_string(),
+          if matches!(mt, MediaType::Unknown) {
+            None
+          } else {
+            Some(mt.as_ts_extension().to_string())
+          },
         )
       })
     })
@@ -4662,6 +4722,7 @@ fn op_script_names(state: &mut OpState) -> ScriptNames {
         let (types, _) = documents.resolve_dependency(
           types,
           specifier,
+          doc.resolution_mode(),
           doc.file_referrer(),
         )?;
         let types_doc = documents.get_or_load(&types, doc.file_referrer())?;
@@ -4700,7 +4761,7 @@ fn op_script_names(state: &mut OpState) -> ScriptNames {
 fn op_script_version(
   state: &mut OpState,
   #[string] specifier: &str,
-) -> Result<Option<String>, AnyError> {
+) -> Result<Option<String>, deno_core::url::ParseError> {
   let state = state.borrow_mut::<State>();
   let mark = state.performance.mark("tsc.op.op_script_version");
   let specifier = state.specifier_map.normalize(specifier)?;
@@ -4765,6 +4826,7 @@ fn run_tsc_thread(
       specifier_map,
       request_rx,
     )],
+    create_params: create_isolate_create_params(),
     startup_snapshot: Some(tsc::compiler_snapshot()),
     inspector: has_inspector_server,
     ..Default::default()
@@ -5354,7 +5416,8 @@ impl TscRequest {
   fn to_server_request<'s>(
     &self,
     scope: &mut v8::HandleScope<'s>,
-  ) -> Result<(&'static str, Option<v8::Local<'s, v8::Value>>), AnyError> {
+  ) -> Result<(&'static str, Option<v8::Local<'s, v8::Value>>), serde_v8::Error>
+  {
     let args = match self {
       TscRequest::GetDiagnostics(args) => {
         ("$getDiagnostics", Some(serde_v8::to_v8(scope, args)?))
@@ -5497,9 +5560,11 @@ impl TscRequest {
 
 #[cfg(test)]
 mod tests {
+  use pretty_assertions::assert_eq;
+  use test_util::TempDir;
+
   use super::*;
   use crate::cache::HttpCache;
-  use crate::http_util::HeadersMap;
   use crate::lsp::cache::LspCache;
   use crate::lsp::config::Config;
   use crate::lsp::config::WorkspaceSettings;
@@ -5507,8 +5572,6 @@ mod tests {
   use crate::lsp::documents::LanguageId;
   use crate::lsp::resolver::LspResolver;
   use crate::lsp::text::LineIndex;
-  use pretty_assertions::assert_eq;
-  use test_util::TempDir;
 
   async fn setup(
     ts_config: Value,
@@ -5569,7 +5632,7 @@ mod tests {
     let (_tx, rx) = mpsc::unbounded_channel();
     let state =
       State::new(state_snapshot, Default::default(), Default::default(), rx);
-    let mut op_state = OpState::new(None);
+    let mut op_state = OpState::new(None, None);
     op_state.put(state);
     op_state
   }
@@ -5729,6 +5792,7 @@ mod tests {
           "sourceLine": "        import { A } from \".\";",
           "category": 2,
           "code": 6133,
+          "reportsUnnecessary": true,
         }]
       })
     );
@@ -5811,6 +5875,7 @@ mod tests {
           "sourceLine": "        import {",
           "category": 2,
           "code": 6192,
+          "reportsUnnecessary": true,
         }, {
           "start": {
             "line": 8,
@@ -5934,7 +5999,7 @@ mod tests {
       .global()
       .set(
         &specifier_dep,
-        HeadersMap::default(),
+        Default::default(),
         b"export const b = \"b\";\n",
       )
       .unwrap();
@@ -5973,7 +6038,7 @@ mod tests {
       .global()
       .set(
         &specifier_dep,
-        HeadersMap::default(),
+        Default::default(),
         b"export const b = \"b\";\n\nexport const a = \"b\";\n",
       )
       .unwrap();
@@ -6394,8 +6459,7 @@ mod tests {
       &mut state,
       ResolveArgs {
         base: temp_dir.url().join("a.ts").unwrap().to_string(),
-        is_base_cjs: false,
-        specifiers: vec!["./b.ts".to_string()],
+        specifiers: vec![(false, "./b.ts".to_string())],
       },
     )
     .unwrap();
@@ -6403,7 +6467,7 @@ mod tests {
       resolved,
       vec![Some((
         temp_dir.url().join("b.ts").unwrap().to_string(),
-        MediaType::TypeScript.as_ts_extension().to_string()
+        Some(MediaType::TypeScript.as_ts_extension().to_string())
       ))]
     );
   }

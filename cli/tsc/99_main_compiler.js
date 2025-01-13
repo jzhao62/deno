@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="./compiler.d.ts" />
@@ -41,6 +41,13 @@ delete Object.prototype.__proto__;
     "listen",
     "listenDatagram",
     "openKv",
+    "connectQuic",
+    "listenQuic",
+    "QuicBidirectionalStream",
+    "QuicConn",
+    "QuicListener",
+    "QuicReceiveStream",
+    "QuicSendStream",
   ]);
   const unstableMsgSuggestion =
     "If not, try changing the 'lib' compiler option to include 'deno.unstable' " +
@@ -121,8 +128,8 @@ delete Object.prototype.__proto__;
   /** @type {Map<string, ts.SourceFile>} */
   const sourceFileCache = new Map();
 
-  /** @type {Map<string, string>} */
-  const sourceTextCache = new Map();
+  /** @type {Map<string, ts.IScriptSnapshot & { isCjs?: boolean; }>} */
+  const scriptSnapshotCache = new Map();
 
   /** @type {Map<string, number>} */
   const sourceRefCounts = new Map();
@@ -132,9 +139,6 @@ delete Object.prototype.__proto__;
 
   /** @type {Map<string, boolean>} */
   const isNodeSourceFileCache = new Map();
-
-  /** @type {Map<string, boolean>} */
-  const isCjsCache = new Map();
 
   // Maps asset specifiers to the first scope that the asset was loaded into.
   /** @type {Map<string, string | null>} */
@@ -210,12 +214,13 @@ delete Object.prototype.__proto__;
       const mapKey = path + key;
       let sourceFile = documentRegistrySourceFileCache.get(mapKey);
       if (!sourceFile || sourceFile.version !== version) {
+        const isCjs = /** @type {any} */ (scriptSnapshot).isCjs;
         sourceFile = ts.createLanguageServiceSourceFile(
           fileName,
           scriptSnapshot,
           {
             ...getCreateSourceFileOptions(sourceFileOptions),
-            impliedNodeFormat: (isCjsCache.get(fileName) ?? false)
+            impliedNodeFormat: isCjs
               ? ts.ModuleKind.CommonJS
               : ts.ModuleKind.ESNext,
             // in the lsp we want to be able to show documentation
@@ -320,7 +325,7 @@ delete Object.prototype.__proto__;
         if (lastRequestMethod != "cleanupSemanticCache") {
           const mapKey = path + key;
           documentRegistrySourceFileCache.delete(mapKey);
-          sourceTextCache.delete(path);
+          scriptSnapshotCache.delete(path);
           ops.op_release(path);
         }
       } else {
@@ -404,9 +409,20 @@ delete Object.prototype.__proto__;
       messageText = formatMessage(msgText, ri.code);
     }
     if (start !== undefined && length !== undefined && file) {
-      const startPos = file.getLineAndCharacterOfPosition(start);
-      const sourceLine = file.getFullText().split("\n")[startPos.line];
-      const fileName = file.fileName;
+      let startPos = file.getLineAndCharacterOfPosition(start);
+      let sourceLine = file.getFullText().split("\n")[startPos.line];
+      const originalFileName = file.fileName;
+      const fileName = ops.op_remap_specifier
+        ? (ops.op_remap_specifier(file.fileName) ?? file.fileName)
+        : file.fileName;
+      // Bit of a hack to detect when we have a .wasm file and want to hide
+      // the .d.ts text. This is not perfect, but will work in most scenarios
+      if (
+        fileName.endsWith(".wasm") && originalFileName.endsWith(".wasm.d.mts")
+      ) {
+        startPos = { line: 0, character: 0 };
+        sourceLine = undefined;
+      }
       return {
         start: startPos,
         end: file.getLineAndCharacterOfPosition(start + length),
@@ -452,6 +468,12 @@ delete Object.prototype.__proto__;
     // We specify the resolution mode to be CommonJS for some npm files and this
     // diagnostic gets generated even though we're using custom module resolution.
     1452,
+    // Module '...' cannot be imported using this construct. The specifier only resolves to an
+    // ES module, which cannot be imported with 'require'.
+    1471,
+    // TS1479: The current file is a CommonJS module whose imports will produce 'require' calls;
+    // however, the referenced file is an ECMAScript module and cannot be imported with 'require'.
+    1479,
     // TS2306: File '.../index.d.ts' is not a module.
     // We get this for `x-typescript-types` declaration files which don't export
     // anything. We prefer to treat these as modules with no exports.
@@ -464,6 +486,9 @@ delete Object.prototype.__proto__;
     2792,
     // TS2307: Cannot find module '{0}' or its corresponding type declarations.
     2307,
+    // Relative import errors to add an extension
+    2834,
+    2835,
     // TS5009: Cannot find the common subdirectory path for the input files.
     5009,
     // TS5055: Cannot write file
@@ -624,8 +649,6 @@ delete Object.prototype.__proto__;
         `"data" is unexpectedly null for "${specifier}".`,
       );
 
-      isCjsCache.set(specifier, isCjs);
-
       sourceFile = ts.createSourceFile(
         specifier,
         data,
@@ -679,14 +702,18 @@ delete Object.prototype.__proto__;
     getNewLine() {
       return "\n";
     },
-    resolveTypeReferenceDirectives(
-      typeDirectiveNames,
+    resolveTypeReferenceDirectiveReferences(
+      typeDirectiveReferences,
       containingFilePath,
       redirectedReference,
       options,
-      containingFileMode,
+      containingSourceFile,
+      _reusedNames,
     ) {
-      return typeDirectiveNames.map((arg) => {
+      const isCjs =
+        containingSourceFile?.impliedNodeFormat === ts.ModuleKind.CommonJS;
+      /** @type {Array<ts.ResolvedTypeReferenceDirectiveWithFailedLookupLocations>} */
+      const result = typeDirectiveReferences.map((arg) => {
         /** @type {ts.FileReference} */
         const fileReference = typeof arg === "string"
           ? {
@@ -696,19 +723,31 @@ delete Object.prototype.__proto__;
           }
           : arg;
         if (fileReference.fileName.startsWith("npm:")) {
-          /** @type {[string, ts.Extension] | undefined} */
+          /** @type {[string, ts.Extension | null] | undefined} */
           const resolved = ops.op_resolve(
             containingFilePath,
-            isCjsCache.get(containingFilePath) ?? false,
-            [fileReference.fileName],
+            [
+              [
+                fileReference.resolutionMode == null
+                  ? isCjs
+                  : fileReference.resolutionMode === ts.ModuleKind.CommonJS,
+                fileReference.fileName,
+              ],
+            ],
           )?.[0];
-          if (resolved) {
+          if (resolved && resolved[1]) {
             return {
-              primary: true,
-              resolvedFileName: resolved[0],
+              resolvedTypeReferenceDirective: {
+                primary: true,
+                resolvedFileName: resolved[0],
+                // todo(dsherret): we should probably be setting this
+                isExternalLibraryImport: undefined,
+              },
             };
           } else {
-            return undefined;
+            return {
+              resolvedTypeReferenceDirective: undefined,
+            };
           }
         } else {
           return ts.resolveTypeReferenceDirective(
@@ -718,34 +757,56 @@ delete Object.prototype.__proto__;
             host,
             redirectedReference,
             undefined,
-            containingFileMode ?? fileReference.resolutionMode,
-          ).resolvedTypeReferenceDirective;
+            containingSourceFile?.impliedNodeFormat ??
+              fileReference.resolutionMode,
+          );
         }
       });
+      return result;
     },
-    resolveModuleNames(specifiers, base) {
+    resolveModuleNameLiterals(
+      moduleLiterals,
+      base,
+      _redirectedReference,
+      compilerOptions,
+      containingSourceFile,
+      _reusedNames,
+    ) {
+      const specifiers = moduleLiterals.map((literal) => [
+        ts.getModeForUsageLocation(
+          containingSourceFile,
+          literal,
+          compilerOptions,
+        ) === ts.ModuleKind.CommonJS,
+        literal.text,
+      ]);
       if (logDebug) {
         debug(`host.resolveModuleNames()`);
         debug(`  base: ${base}`);
-        debug(`  specifiers: ${specifiers.join(", ")}`);
+        debug(`  specifiers: ${specifiers.map((s) => s[1]).join(", ")}`);
       }
-      /** @type {Array<[string, ts.Extension] | undefined>} */
+      /** @type {Array<[string, ts.Extension | null] | undefined>} */
       const resolved = ops.op_resolve(
         base,
-        isCjsCache.get(base) ?? false,
         specifiers,
       );
       if (resolved) {
+        /** @type {Array<ts.ResolvedModuleWithFailedLookupLocations>} */
         const result = resolved.map((item) => {
-          if (item) {
+          if (item && item[1]) {
             const [resolvedFileName, extension] = item;
             return {
-              resolvedFileName,
-              extension,
-              isExternalLibraryImport: false,
+              resolvedModule: {
+                resolvedFileName,
+                extension,
+                // todo(dsherret): we should probably be setting this
+                isExternalLibraryImport: false,
+              },
             };
           }
-          return undefined;
+          return {
+            resolvedModule: undefined,
+          };
         });
         result.length = specifiers.length;
         return result;
@@ -814,19 +875,19 @@ delete Object.prototype.__proto__;
           return ts.ScriptSnapshot.fromString(sourceFile.text);
         }
       }
-      let sourceText = sourceTextCache.get(specifier);
-      if (sourceText == undefined) {
+      let scriptSnapshot = scriptSnapshotCache.get(specifier);
+      if (scriptSnapshot == undefined) {
         /** @type {{ data: string, version: string, isCjs: boolean }} */
         const fileInfo = ops.op_load(specifier);
         if (!fileInfo) {
           return undefined;
         }
-        isCjsCache.set(specifier, fileInfo.isCjs);
-        sourceTextCache.set(specifier, fileInfo.data);
+        scriptSnapshot = ts.ScriptSnapshot.fromString(fileInfo.data);
+        scriptSnapshot.isCjs = fileInfo.isCjs;
+        scriptSnapshotCache.set(specifier, scriptSnapshot);
         scriptVersionCache.set(specifier, fileInfo.version);
-        sourceText = fileInfo.data;
       }
-      return ts.ScriptSnapshot.fromString(sourceText);
+      return scriptSnapshot;
     },
   };
 
@@ -990,24 +1051,27 @@ delete Object.prototype.__proto__;
       configFileParsingDiagnostics,
     });
 
-    const checkFiles = localOnly
-      ? rootNames
-        .filter((n) => !n.startsWith("http"))
-        .map((checkName) => {
-          const sourceFile = program.getSourceFile(checkName);
-          if (sourceFile == null) {
-            throw new Error("Could not find source file for: " + checkName);
-          }
-          return sourceFile;
-        })
-      : undefined;
+    let checkFiles = undefined;
 
-    if (checkFiles != null) {
+    if (localOnly) {
+      const checkFileNames = new Set();
+      checkFiles = [];
+
+      for (const checkName of rootNames) {
+        if (checkName.startsWith("http")) {
+          continue;
+        }
+        const sourceFile = program.getSourceFile(checkName);
+        if (sourceFile != null) {
+          checkFiles.push(sourceFile);
+        }
+        checkFileNames.add(checkName);
+      }
+
       // When calling program.getSemanticDiagnostics(...) with a source file, we
       // need to call this code first in order to get it to invalidate cached
       // diagnostics correctly. This is what program.getSemanticDiagnostics()
       // does internally when calling without any arguments.
-      const checkFileNames = new Set(checkFiles.map((f) => f.fileName));
       while (
         program.getSemanticDiagnosticsOfNextAffectedFile(
           undefined,
@@ -1238,7 +1302,7 @@ delete Object.prototype.__proto__;
           closed = true;
         }
         scriptVersionCache.delete(script);
-        sourceTextCache.delete(script);
+        scriptSnapshotCache.delete(script);
       }
 
       if (newConfigsByScope || opened || closed) {

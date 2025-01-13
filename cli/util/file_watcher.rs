@@ -1,12 +1,16 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::args::Flags;
-use crate::colors;
-use crate::util::fs::canonicalize_path;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::io::IsTerminal;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use deno_config::glob::PathOrPatternSet;
 use deno_core::error::AnyError;
-use deno_core::error::JsError;
+use deno_core::error::CoreError;
 use deno_core::futures::Future;
 use deno_core::futures::FutureExt;
 use deno_core::parking_lot::Mutex;
@@ -18,17 +22,15 @@ use notify::Error as NotifyError;
 use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::io::IsTerminal;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::select;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::sleep;
+
+use crate::args::Flags;
+use crate::colors;
+use crate::util::fs::canonicalize_path;
 
 const CLEAR_SCREEN: &str = "\x1B[H\x1B[2J\x1B[3J";
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(200);
@@ -73,18 +75,20 @@ impl DebouncedReceiver {
   }
 }
 
-#[allow(clippy::print_stderr)]
 async fn error_handler<F>(watch_future: F) -> bool
 where
   F: Future<Output = Result<(), AnyError>>,
 {
   let result = watch_future.await;
   if let Err(err) = result {
-    let error_string = match err.downcast_ref::<JsError>() {
-      Some(e) => format_js_error(e),
-      None => format!("{err:?}"),
-    };
-    eprintln!(
+    let error_string =
+      match crate::util::result::any_and_jserrorbox_downcast_ref::<CoreError>(
+        &err,
+      ) {
+        Some(CoreError::Js(e)) => format_js_error(e),
+        _ => format!("{err:?}"),
+      };
+    log::error!(
       "{}: {}",
       colors::red_bold("error"),
       error_string.trim_start_matches("error: ")
@@ -128,19 +132,12 @@ impl PrintConfig {
   }
 }
 
-fn create_print_after_restart_fn(
-  banner: &'static str,
-  clear_screen: bool,
-) -> impl Fn() {
+fn create_print_after_restart_fn(clear_screen: bool) -> impl Fn() {
   move || {
     #[allow(clippy::print_stderr)]
     if clear_screen && std::io::stderr().is_terminal() {
       eprint!("{}", CLEAR_SCREEN);
     }
-    info!(
-      "{} File change detected! Restarting!",
-      colors::intense_blue(banner),
-    );
   }
 }
 
@@ -178,9 +175,9 @@ impl WatcherCommunicator {
 
   pub async fn watch_for_changed_paths(
     &self,
-  ) -> Result<Option<Vec<PathBuf>>, AnyError> {
+  ) -> Result<Option<Vec<PathBuf>>, RecvError> {
     let mut rx = self.changed_paths_rx.resubscribe();
-    rx.recv().await.map_err(AnyError::from)
+    rx.recv().await
   }
 
   pub fn change_restart_mode(&self, restart_mode: WatcherRestartMode) {
@@ -188,7 +185,17 @@ impl WatcherCommunicator {
   }
 
   pub fn print(&self, msg: String) {
-    log::info!("{} {}", self.banner, msg);
+    log::info!("{} {}", self.banner, colors::gray(msg));
+  }
+
+  pub fn show_path_changed(&self, changed_paths: Option<Vec<PathBuf>>) {
+    if let Some(paths) = changed_paths {
+      if !paths.is_empty() {
+        self.print(format!("Restarting! File change detected: {:?}", paths[0]))
+      } else {
+        self.print("Restarting! File change detected.".to_string())
+      }
+    }
   }
 }
 
@@ -264,7 +271,7 @@ where
     clear_screen,
   } = print_config;
 
-  let print_after_restart = create_print_after_restart_fn(banner, clear_screen);
+  let print_after_restart = create_print_after_restart_fn(clear_screen);
   let watcher_communicator = Arc::new(WatcherCommunicator {
     paths_to_watch_tx: paths_to_watch_tx.clone(),
     changed_paths_rx: changed_paths_rx.resubscribe(),

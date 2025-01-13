@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // deno-lint-ignore-file no-undef no-console
 
@@ -1151,4 +1151,10 @@ Deno.test("process.cpuUsage()", () => {
 Deno.test("process.stdout.columns writable", () => {
   process.stdout.columns = 80;
   assertEquals(process.stdout.columns, 80);
+});
+
+Deno.test("getBuiltinModule", () => {
+  assert(process.getBuiltinModule("fs"));
+  assert(process.getBuiltinModule("node:fs"));
+  assertEquals(process.getBuiltinModule("something"), undefined);
 });
